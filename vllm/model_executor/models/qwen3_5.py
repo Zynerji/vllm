@@ -244,6 +244,13 @@ class Qwen3_5Model(Qwen3NextModel):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            # Without quant_config and prefix, a compressed-tensors checkpoint that quantizes
+            # embed_tokens builds an UNQUANTIZED embedding here, and loading then fails with
+            # "no module or parameter named embed_tokens.weight_packed". The scheme is matched by
+            # layer name, so the prefix is required for the target regex to resolve.
+            # Other families (e.g. llama.py) already pass both.
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
