@@ -1032,6 +1032,68 @@ class VllmConfig:
                 "are normalized over the same nucleus as the sampling mask"
             )
 
+    def _maybe_auto_enable_mtp(self) -> None:
+        """Turn on MTP speculative decoding when the checkpoint ships a draft head.
+
+        `speculative_config` defaults to None, so a model that carries a
+        multi-token-prediction head gets no benefit from it unless the caller
+        happens to know to ask. In practice that means most users of such a
+        checkpoint silently run slower than the weights they downloaded allow,
+        and nothing in the model repo can change that -- it is an engine
+        argument, not model metadata.
+
+        Speculative decoding is distribution-preserving (drafts are verified
+        against the target model), so enabling it cannot change outputs; it can
+        only change speed. Set VLLM_AUTO_MTP=0 to opt out.
+
+        Note the gain is hardware-dependent and not always positive: measured
+        1.49x on a 3090 Ti but 0.92x on a 5090, and it will not initialise at all
+        on a 16 GB card, which has no headroom for the draft model.
+        """
+        import os
+
+        if os.getenv("VLLM_AUTO_MTP", "1") == "0":
+            return
+        if self.speculative_config is not None or self.model_config is None:
+            return
+
+        hf = getattr(self.model_config, "hf_config", None)
+        if hf is None:
+            return
+        text = getattr(hf, "text_config", hf)
+        n_predict = getattr(hf, "num_nextn_predict_layers", None) or getattr(
+            text, "num_nextn_predict_layers", None
+        )
+        n_predict = (
+            n_predict
+            or getattr(hf, "mtp_num_hidden_layers", None)
+            or getattr(text, "mtp_num_hidden_layers", None)
+        )
+        if not n_predict or n_predict < 1:
+            return
+
+        k = int(os.getenv("VLLM_AUTO_MTP_TOKENS", "1"))
+        logger.info(
+            "Model declares an MTP head (%d layer(s)); enabling speculative "
+            "decoding with num_speculative_tokens=%d. Set VLLM_AUTO_MTP=0 to disable.",
+            n_predict,
+            k,
+        )
+        from vllm.config.speculative import SpeculativeConfig
+
+        try:
+            self.speculative_config = SpeculativeConfig(
+                method="mtp",
+                num_speculative_tokens=k,
+                target_model_config=self.model_config,
+                target_parallel_config=self.parallel_config,
+                enable_chunked_prefill=self.scheduler_config.enable_chunked_prefill,
+                disable_log_stats=self.observability_config.disable_log_stats,
+            )
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("Could not auto-enable MTP (%s); continuing without it.", exc)
+            self.speculative_config = None
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1042,6 +1104,8 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+
+        self._maybe_auto_enable_mtp()
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
