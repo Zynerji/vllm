@@ -84,6 +84,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            # Without quant_config and prefix, a compressed-tensors checkpoint that
+            # quantizes embed_tokens builds an UNQUANTIZED embedding here, and loading
+            # then fails with "no module or parameter named embed_tokens.weight_packed".
+            # The scheme is matched by layer NAME, so prefix is required for the target
+            # regex to resolve. llama.py already passes both.
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
