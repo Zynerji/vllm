@@ -1,3 +1,105 @@
+<!-- EKTOME FORK NOTICE -->
+# Zynerji/vllm — fork notice
+
+**A fork of [vllm-project/vllm](https://github.com/vllm-project/vllm) carrying three patches that
+let vLLM serve checkpoints whose `embed_tokens` and `lm_head` are quantized.**
+
+Upstream quantizes the transformer blocks happily but assumes the two vocabulary projections stay
+in full precision. On Qwen3.8-27B those are two `248320 x 5120` tensors — roughly 6 GB in BF16 —
+which is the difference between "fits on a 24 GB card with long context" and "does not fit".
+Everything here exists to close that gap. Nothing changes sampling, scheduling, or numerics for an
+ordinary checkpoint.
+
+Built for [`Zynerji/Qwen3.8-27B-PristinelyUncensored-HOMEUSER-16-24`](https://huggingface.co/Zynerji/Qwen3.8-27B-PristinelyUncensored-HOMEUSER-16-24),
+but none of it is model-specific beyond the Qwen3.5 file paths.
+
+## Install
+
+```bash
+pip install git+https://github.com/Zynerji/vllm@ektome-homeuser-v2
+```
+
+> **The patches live on `ektome-homeuser-v2`, not `main`.** `main` tracks upstream unchanged —
+> cloning the default branch gets you stock vLLM.
+
+## What changed, and why
+
+Three commits, four files, **+81 lines and 0 deletions** on top of upstream `main`.
+
+### 1. Pass `quant_config` and `prefix` to Qwen3.5 `embed_tokens`
+`vllm/model_executor/models/qwen3_5.py`, `qwen3_5_mtp.py` · +7/+7
+
+Both `Qwen3_5Model` and `Qwen3_5MultiTokenPredictor` built their `VocabParallelEmbedding` without
+`quant_config` or `prefix`. Against a compressed-tensors checkpoint that quantizes the embedding
+this silently constructs an **unquantized** embedding, and loading dies with:
+
+```
+no module or parameter named 'embed_tokens.weight_packed'
+```
+
+`prefix` is load-bearing, not cosmetic: compressed-tensors matches schemes **by layer name**, so
+without it the target regex cannot resolve. `llama.py` already passes both — this brings the Qwen
+paths in line. The MTP site matters separately: without it the speculative head fails at engine
+init with the same error inside `Qwen3_5MultiTokenPredictor`.
+
+### 2. Expose `LinearBase` geometry on `ParallelLMHead`
+`vllm/model_executor/layers/vocab_parallel_embedding.py` · +13
+
+`ParallelLMHead` is the only quantizable projection in vLLM that does **not** derive from
+`LinearBase`. Quantization schemes read geometry off the module they are handed, so a checkpoint
+that quantizes `lm_head` makes schemes such as `CompressedTensorsW8A16Fp8` raise `AttributeError`.
+
+The patch sets the six attributes they look for — `output_partition_sizes`, `logical_widths`,
+`output_size_per_partition`, `input_size`, `input_size_per_partition`, `has_bias` — each derived
+from state the layer already tracks. No behaviour change for an unquantized `lm_head`.
+
+### 3. Auto-enable MTP when the checkpoint ships a draft head
+`vllm/config/vllm.py` · +64
+
+`speculative_config` defaults to `None`, so a checkpoint carrying a multi-token-prediction head
+gets no benefit from it unless the caller knows to ask — and nothing in a model repo can signal
+that, because it is an engine argument rather than model metadata.
+
+`VllmConfig._maybe_auto_enable_mtp()` runs from `__post_init__`, looks for
+`num_nextn_predict_layers` / `mtp_num_hidden_layers` on the HF config, and builds a
+`SpeculativeConfig(method="mtp")` when it finds one. Speculative decoding is
+**distribution-preserving** — drafts are verified against the target model — so this cannot change
+outputs, only speed. It is wrapped so that a failure to construct the config logs a warning and
+continues rather than blocking startup.
+
+| variable | default | effect |
+|---|---|---|
+| `VLLM_AUTO_MTP` | `1` | set `0` to opt out entirely |
+| `VLLM_AUTO_MTP_TOKENS` | `1` | `num_speculative_tokens` |
+
+**The payoff is hardware-dependent and not always positive.** Measured on this checkpoint family:
+**1.49× on a 3090 Ti, 0.92× on a 5090** — Ampere gains, Ada and Blackwell lose. It will not
+initialise at all on a 16 GB card, which has no headroom for the draft model. Treat no single
+number as a family figure; if it costs you throughput, set `VLLM_AUTO_MTP=0`.
+
+## Upstreaming
+
+All three are narrow: two are consistency fixes bringing Qwen3.5 and `ParallelLMHead` in line with
+what other models and layers already do, and the third is opt-out-able and cannot change outputs.
+No private APIs, no vendored dependencies, no new build steps — rebasing onto a newer upstream
+should be mechanical.
+
+## A note on `ektome-homeuser` (the previous branch)
+
+The original branch is retained so existing pins keep resolving, but **it should not be used**. Its
+three commits were made with CRLF line endings against LF originals, so git recorded every file as
+a whole-file rewrite: an 11-line addition showed as `@@ -1,581 +1,594 @@`, and `vllm/config/vllm.py`
+reported `+2737/-2679` for 58 net lines. That made the diff unreviewable, destroyed `git blame`,
+guaranteed a conflict on every line of any rebase, and left the branch unupstreamable. It was also
+missing the `qwen3_5_mtp.py` half of patch 1 while *enabling* MTP by default — a combination that
+fails at engine init on exactly the checkpoints this fork exists to serve.
+
+`ektome-homeuser-v2` is that work rebuilt cleanly on current upstream: LF throughout, pure
+additions, and the missing patch included.
+
+---
+<!-- END EKTOME FORK NOTICE -->
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
